@@ -61,17 +61,17 @@ require.register("ejs.js", function(module, exports, require){
  */
 
 var utils = require('./utils')
-  , fs = require('fs');
-
-/**
- * Library version.
- */
-
-exports.version = '0.7.2';
+  , path = require('path')
+  , basename = path.basename
+  , dirname = path.dirname
+  , extname = path.extname
+  , join = path.join
+  , fs = require('fs')
+  , read = fs.readFileSync;
 
 /**
  * Filters.
- * 
+ *
  * @type Object
  */
 
@@ -79,7 +79,7 @@ var filters = exports.filters = require('./filters');
 
 /**
  * Intermediate js cache.
- * 
+ *
  * @type Object
  */
 
@@ -140,9 +140,9 @@ function rethrow(err, str, filename, lineno){
 
   // Alter exception message
   err.path = filename;
-  err.message = (filename || 'ejs') + ':' 
-    + lineno + '\n' 
-    + context + '\n\n' 
+  err.message = (filename || 'ejs') + ':'
+    + lineno + '\n'
+    + context + '\n\n'
     + err.message;
   
   throw err;
@@ -155,26 +155,27 @@ function rethrow(err, str, filename, lineno){
  * @return {String}
  * @api public
  */
-
 var parse = exports.parse = function(str, options){
   var options = options || {}
     , open = options.open || exports.open || '<%'
-    , close = options.close || exports.close || '%>';
+    , close = options.close || exports.close || '%>'
+    , filename = options.filename
+    , compileDebug = options.compileDebug !== false
+    , buf = [];
 
-  var buf = [
-      "var buf = [];"
-    , "\nwith (locals) {"
-    , "\n  buf.push('"
-  ];
-  
+  buf.push('var buf = [];');
+  if (false !== options._with) buf.push('\nwith (locals || {}) { (function(){ ');
+  buf.push('\n buf.push(\'');
+
   var lineno = 1;
-
   var consumeEOL = false;
   for (var i = 0, len = str.length; i < len; ++i) {
     if (str.slice(i, open.length + i) == open) {
       i += open.length
   
-      var prefix, postfix, line = '__stack.lineno=' + lineno;
+      var prefix, postfix, line = (compileDebug ? '__stack.lineno=' : '') + lineno;
+      var ignore = false, closeTag = close;
+
       switch (str.substr(i, 1)) {
         case '=':
           prefix = "', escape((" + line + ', ';
@@ -186,32 +187,53 @@ var parse = exports.parse = function(str, options){
           postfix = "), '";
           ++i;
           break;
+        case '!':
+          ignore = true;
+          ++i;
+          closeTag = "!"+ close;
+          break;
         default:
           prefix = "');" + line + ';';
           postfix = "; buf.push('";
       }
-
-      var end = str.indexOf(close, i)
+      var end = str.indexOf(closeTag, i)
         , js = str.substring(i, end)
         , start = i
+        , include = null
         , n = 0;
-        
-      if ('-' == js[js.length-1]){
-        js = js.substring(0, js.length - 2);
-        consumeEOL = true;
+      if (!ignore) {
+        if ('-' == js[js.length-1]){
+          js = js.substring(0, js.length - 2);
+          consumeEOL = true;
       }
-        
-      while (~(n = js.indexOf("\n", n))) n++, lineno++;
-      if (js.substr(0, 1) == ':') js = filtered(js);
-      buf.push(prefix, js, postfix);
-      i += end - start + close.length - 1;
 
+        if (0 == js.trim().indexOf('include')) {
+          var name = js.trim().slice(7).trim();
+          if (!filename) throw new Error('filename option is required for includes');
+          var path = resolveInclude(name, filename);
+          include = read(path, 'utf8');
+          include = exports.parse(include, { filename: path, _with: false, open: open, close: close, compileDebug: compileDebug });
+          buf.push("' + (function(){" + include + "})() + '");
+          js = '';
+        }
+
+        while (~(n = js.indexOf("\n", n))) n++, lineno++;
+        if (js.substr(0, 1) == ':') js = filtered(js);
+        if (js) {
+          if (js.lastIndexOf('//') > js.lastIndexOf('\n')) js += '\n';
+
+          buf.push(prefix, js, postfix);
+        }
+      } else {
+          buf.push(utils.escapeForString(js));
+      }
+      i += end - start + closeTag.length - 1;
     } else if (str.substr(i, 1) == "\\") {
       buf.push("\\\\");
     } else if (str.substr(i, 1) == "'") {
       buf.push("\\'");
     } else if (str.substr(i, 1) == "\r") {
-      buf.push(" ");
+      // ignore
     } else if (str.substr(i, 1) == "\n") {
       if (consumeEOL) {
         consumeEOL = false;
@@ -224,7 +246,9 @@ var parse = exports.parse = function(str, options){
     }
   }
 
-  buf.push("');\n}\nreturn buf.join('');");
+  if (false !== options._with) buf.push("'); })();\n} \nreturn buf.join('');")
+  else buf.push("');\nreturn buf.join('');");
+
   return buf.join('');
 };
 
@@ -239,27 +263,48 @@ var parse = exports.parse = function(str, options){
 
 var compile = exports.compile = function(str, options){
   options = options || {};
+  var escape = options.escape || utils.escape;
   
   var input = JSON.stringify(str)
+    , compileDebug = options.compileDebug !== false
+    , client = options.client
     , filename = options.filename
         ? JSON.stringify(options.filename)
         : 'undefined';
   
-  // Adds the fancy stack trace meta info
-  str = [
-    'var __stack = { lineno: 1, input: ' + input + ', filename: ' + filename + ' };',
-    rethrow.toString(),
-    'try {',
-    exports.parse(str, options),
-    '} catch (err) {',
-    '  rethrow(err, __stack.input, __stack.filename, __stack.lineno);',
-    '}'
-  ].join("\n");
+  if (compileDebug) {
+    // Adds the fancy stack trace meta info
+    str = [
+      'var __stack = { lineno: 1, input: ' + input + ', filename: ' + filename + ' };',
+      rethrow.toString(),
+      'try {',
+      exports.parse(str, options),
+      '} catch (err) {',
+      '  rethrow(err, __stack.input, __stack.filename, __stack.lineno);',
+      '}'
+    ].join("\n");
+  } else {
+    str = exports.parse(str, options);
+  }
   
   if (options.debug) console.log(str);
-  var fn = new Function('locals, filters, escape', str);
+  if (client) str = 'escape = escape || ' + escape.toString() + ';\n' + str;
+
+  try {
+    var fn = new Function('locals, filters, escape', str);
+  } catch (err) {
+    if ('SyntaxError' == err.name) {
+      err.message += options.filename
+        ? ' in ' + filename
+        : ' while compiling ejs';
+    }
+    throw err;
+  }
+
+  if (client) return fn;
+
   return function(locals){
-    return fn.call(this, locals, filters, utils.escape);
+    return fn.call(this, locals, filters, escape);
   }
 };
 
@@ -320,14 +365,30 @@ exports.renderFile = function(path, options, fn){
 
   try {
     var str = options.cache
-      ? cache[key] || (cache[key] = fs.readFileSync(path, 'utf8'))
-      : fs.readFileSync(path, 'utf8');
+      ? cache[key] || (cache[key] = read(path, 'utf8'))
+      : read(path, 'utf8');
 
     fn(null, exports.render(str, options));
   } catch (err) {
     fn(err);
   }
 };
+
+/**
+ * Resolve include `name` relative to `filename`.
+ *
+ * @param {String} name
+ * @param {String} filename
+ * @return {String}
+ * @api private
+ */
+
+function resolveInclude(name, filename) {
+  var path = join(dirname(filename), name);
+  var ext = extname(name);
+  if (!ext) path += '.ejs';
+  return path;
+}
 
 // express support
 
@@ -574,7 +635,14 @@ exports.escape = function(html){
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 };
- 
+
+exports.escapeForString = function(html){
+    return String(html)
+        .replace(/\\\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\r/g, '')
+        .replace(/\n/g, '\\n');
+};
 }); // module: utils.js
 
  return require("ejs");
